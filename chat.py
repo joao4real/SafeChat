@@ -8,6 +8,17 @@ from cryptography import x509
 from cryptography.hazmat.primitives.serialization import Encoding, load_pem_private_key
 from cryptography.hazmat.primitives.asymmetric import padding
 
+
+def load_and_validate_cert(cert_data):
+    """Validate and load the certificate."""
+    try:
+        certificate = x509.load_pem_x509_certificate(cert_data, backend=default_backend())
+        print("Certificate is valid.")
+        return certificate
+    except Exception as e:
+        raise ValueError(f"Failed to load or validate certificate: {e}")
+
+
 def decrypt_session_key(encrypted_session_key, private_key):
     """Decrypt the session key with the agent's private key."""
     print("Decrypting session key...")
@@ -20,15 +31,14 @@ def decrypt_session_key(encrypted_session_key, private_key):
                 label=None
             )
         )
-        # Ensure that the session key is 32 bytes long (256 bits)
         if len(session_key) != 32:
             raise ValueError(f"Invalid session key size: {len(session_key)} bytes")
-        
         print(f"Decrypted session key: {session_key.hex()}")
         return session_key
     except Exception as e:
         print(f"Error during decryption: {e}")
         raise
+
 
 def encrypt_session_key(session_key, recipient_public_key):
     """Encrypt the session key with the recipient's public key."""
@@ -42,10 +52,11 @@ def encrypt_session_key(session_key, recipient_public_key):
         )
     )
 
+
 def decrypt_message(encrypted_message, session_key):
     """Decrypt a message using the session key (AES)."""
-    encrypted_message = base64.b64decode(encrypted_message)  # Decode from base64 if necessary
-    iv, encrypted_message = encrypted_message[:16], encrypted_message[16:]  # IV is the first 16 bytes
+    encrypted_message = base64.b64decode(encrypted_message)
+    iv, encrypted_message = encrypted_message[:16], encrypted_message[16:]
     cipher = Cipher(algorithms.AES(session_key), modes.CFB(iv), backend=default_backend())
     decryptor = cipher.decryptor()
     decrypted_message = decryptor.update(encrypted_message) + decryptor.finalize()
@@ -54,11 +65,12 @@ def decrypt_message(encrypted_message, session_key):
         return decrypted_message.decode('utf-8')
     except UnicodeDecodeError as e:
         print(f"Error decoding message: {e}")
-        return decrypted_message  # Return raw bytes if decoding fails
+        return decrypted_message
+
 
 def encrypt_message(message, session_key):
     """Encrypt a message using the session key (AES)."""
-    iv = os.urandom(16)  # Generate a random IV
+    iv = os.urandom(16)
     cipher = Cipher(algorithms.AES(session_key), modes.CFB(iv), backend=default_backend())
     encryptor = cipher.encryptor()
 
@@ -68,7 +80,8 @@ def encrypt_message(message, session_key):
         print(f"Error encoding message: {e}")
         encrypted_message = encryptor.update(message) + encryptor.finalize()
 
-    return base64.b64encode(iv + encrypted_message)  # Prepend IV to the message and encode to base64
+    return base64.b64encode(iv + encrypted_message)
+
 
 def load_private_key(file_path, passphrase=None):
     """Load the private key from the PEM file."""
@@ -78,6 +91,7 @@ def load_private_key(file_path, passphrase=None):
             password=passphrase.encode() if passphrase else None,
             backend=default_backend()
         )
+
 
 def start_chat(agent, port=5001):
     """Starts the chat after certificate and session key exchange."""
@@ -108,29 +122,23 @@ def start_chat(agent, port=5001):
                 conn.sendall(my_cert_data)
                 
                 # Receive the other agent's certificate
-                peer_cert_data = b"" 
-                while True:
-                    chunk = conn.recv(1024)
-                    peer_cert_data += chunk
-                    if len(chunk) < 1024:  # Assuming this marks the end
-                        break
+                peer_cert_data = conn.recv(4096)  # Adjust buffer size if necessary
                 
-                # Load the peer's certificate to extract their public key
-                peer_cert = x509.load_pem_x509_certificate(peer_cert_data)
+                # Validate the received certificate
+                peer_cert = load_and_validate_cert(peer_cert_data)
                 peer_public_key = peer_cert.public_key()
                 print("Certificate exchange successful.")
 
                 # Step 2: Session Key Exchange
                 if port == 5001:
                     # Agent 1 generates and encrypts the session key
-                    session_key = os.urandom(32)  # AES-256 session key (32 bytes = 256 bits)
+                    session_key = os.urandom(32)
                     encrypted_session_key = encrypt_session_key(session_key, peer_public_key)
                     print(f"Agent 1 sent encrypted session key: {base64.b64encode(encrypted_session_key).decode('utf-8')}")
-                    conn.sendall(encrypted_session_key)  # Send as bytes (no need to convert to string)
+                    conn.sendall(encrypted_session_key)
                 else:
                     # Agent 2 receives and decrypts the session key
                     encrypted_session_key = conn.recv(2048)
-                    print(f"Encrypted session key received: {base64.b64encode(encrypted_session_key).decode('utf-8')}")
                     with open(agent.private_key_file_path, "rb") as key_file:
                         private_key = load_pem_private_key(
                             key_file.read(),
@@ -149,7 +157,6 @@ def start_chat(agent, port=5001):
                 # Step 3: Chat Loop
                 while True:
                     if port == 5001:
-                        # Agent 1 sends first
                         message = input("You: ")
                         if message.lower() == 'exit':
                             print("Ending chat session.")
@@ -163,7 +170,6 @@ def start_chat(agent, port=5001):
                             break
                         print(f"Other Agent: {decrypt_message(encrypted_response, session_key)}")
                     else:
-                        # Agent 2 receives first
                         encrypted_message = conn.recv(2048)
                         if not encrypted_message:
                             print("Other agent disconnected.")

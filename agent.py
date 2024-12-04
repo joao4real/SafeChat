@@ -46,7 +46,7 @@ class Agent:
     def get_passphrase(self):
         while True:
             pem_passphrase = getpass.getpass("Enter the PEM passphrase: ")
-            if len(pem_passphrase) >= 0:
+            if len(pem_passphrase) >= 8:
                 confirm_passphrase = getpass.getpass("Confirm the PEM passphrase: ")
                 if pem_passphrase == confirm_passphrase:
                     return pem_passphrase.encode('utf-8')  # Convert passphrase to bytes
@@ -61,7 +61,7 @@ class Agent:
             # Prompt for PEM passphrase if not already provided
             while True:
                 pem_passphrase = getpass.getpass("Enter the PEM passphrase to load the private key: ")
-                if len(pem_passphrase) >= 0:
+                if len(pem_passphrase) >= 8:
                     self.pem_passphrase = pem_passphrase.encode('utf-8')
                     break
                 else:
@@ -80,10 +80,11 @@ class Agent:
         return private_key.public_key()
 
     def create_csr(self, private_key):
+        ### CHANGE THE ATTRIBUTES TO PROMPT WISE
         csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([
             x509.NameAttribute(x509.NameOID.COUNTRY_NAME, "PT"),
             x509.NameAttribute(x509.NameOID.STATE_OR_PROVINCE_NAME, "Lisboa"),
-            x509.NameAttribute(x509.NameOID.LOCALITY_NAME, "Sintra"),
+            x509.NameAttribute(x509.NameOID.LOCALITY_NAME, "Porto"),
             x509.NameAttribute(x509.NameOID.ORGANIZATION_NAME, "AgentCA"),
             x509.NameAttribute(x509.NameOID.COMMON_NAME, f"Agent{self.agent_id}"),
         ]))
@@ -91,32 +92,58 @@ class Agent:
         with open(self.csr_file_path, "wb") as file:
             file.write(csr.public_bytes(serialization.Encoding.PEM))
         return csr
+    
+    def send_csr_to_gateway(self, csr_pem):
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect(('localhost', 5000))  # Connect to the Gateway server (localhost:5000)
+
+                # Receive the Gateway's certificate
+                gateway_cert_data = b""
+                while True:
+                    chunk = s.recv(1024)
+                    gateway_cert_data += chunk
+                    if len(chunk) < 1024:  # Assuming this is the end of the certificate data
+                        break
+
+                # Save or store the Gateway's certificate
+                if gateway_cert_data:
+                    gateway_cert = x509.load_pem_x509_certificate(gateway_cert_data)
+                    print("Gateway's certificate received successfully.")
+                else:
+                    raise ValueError("Failed to receive Gateway's certificate.")
+
+                # Send the CSR to the Gateway
+                s.sendall(csr_pem)
+
+                # Receive the signed certificate from the Gateway
+                signed_cert_data = b""
+                while True:
+                    chunk = s.recv(1024)
+                    signed_cert_data += chunk
+                    if len(chunk) < 1024:  # Assuming this is the end of the certificate data
+                        break
+
+                if signed_cert_data:
+                    return signed_cert_data
+                else:
+                    raise ValueError("Failed to receive signed certificate from Gateway.")
+        except Exception as e:
+            print(f"Error communicating with Gateway: {e}")
+            return None
+
+    def save_signed_certificate(self, signed_cert):
+        if signed_cert:
+            with open(self.signed_cert_file_path, "wb") as file:
+                file.write(signed_cert)
+            print(f"Signed certificate saved to {self.signed_cert_file_path}")
+        else:
+            print("Failed to receive signed certificate.")
 
     def generate_session_key(self):
         """Generate a random session key (AES key)."""
         return os.urandom(32)  # AES-256 key
-
-    def encrypt_session_key(self, session_key, public_key):
-        """Encrypt the session key with the recipient's public key."""
-        return public_key.encrypt(
-            session_key,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
-            )
-        )
-
-    def decrypt_session_key(self, encrypted_session_key, private_key):
-        """Decrypt the session key with the agent's private key."""
-        return private_key.decrypt(
-            encrypted_session_key,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
-            )
-        )
+    
     
     def load_peer_public_key_from_cert(self, cert_path):
         """Load the peer's public key from their certificate."""
@@ -146,7 +173,10 @@ def main():
 
         private_key = agent.create_private_key()
         csr = agent.create_csr(private_key)
-        print(f"Generated CSR: {csr}")
+        print("Generated CSR")
+        print("Sending CSR to Gateway for signing...")
+        signed_cert = agent.send_csr_to_gateway(csr.public_bytes(serialization.Encoding.PEM))
+        agent.save_signed_certificate(signed_cert)
 
     # Load the private key for decryption
     agent.private_key = agent.load_private_key()

@@ -151,12 +151,15 @@ class Gateway:
 def run_gateway_server(host='localhost', port=5000):
     gateway = Gateway()
 
-    # Check if the certificate and private key already exist
+    # Check and validate the Gateway's certificate
     if gateway.check_existing_files():
-        # Load existing certificate and private key
         certificate, private_key = gateway.load_existing_certificate_and_key(1)
+        try:
+            x509.load_pem_x509_certificate(certificate.public_bytes(serialization.Encoding.PEM))
+            print("Gateway certificate is valid.")
+        except Exception as e:
+            raise ValueError(f"Invalid Gateway certificate: {e}")
     else:
-        # Create a new private key and certificate
         private_key = gateway.create_private_key()
         certificate = gateway.create_certificate(private_key)
 
@@ -166,33 +169,28 @@ def run_gateway_server(host='localhost', port=5000):
         print(f"Gateway listening on {host}:{port}")
 
         while True:
-            signal.signal(signal.SIGINT, gateway.signal_handler)
             client_socket, client_address = server_socket.accept()
             with client_socket:
                 print(f"Connection established with {client_address}")
 
                 try:
-                    # Send the Gateway's certificate to the Agent
-                    client_socket.sendall(certificate.public_bytes(serialization.Encoding.PEM))
+                    # Send the Gateway's certificate
+                    cert_bytes = certificate.public_bytes(serialization.Encoding.PEM)
+                    client_socket.sendall(len(cert_bytes).to_bytes(4, 'big') + cert_bytes)
 
-                    # Receive the CSR from the Agent
-                    csr_data = b""
-                    while True:
-                        chunk = client_socket.recv(1024)
-                        csr_data += chunk
-                        if len(chunk) < 1024:  # Assuming this is the end of the data
-                            break
+                    # Receive and validate the CSR
+                    csr_length = int.from_bytes(client_socket.recv(4), 'big')
+                    csr_data = client_socket.recv(csr_length)
+                    try:
+                        csr = x509.load_pem_x509_csr(csr_data)
+                        print("Received CSR is valid.")
+                    except Exception as e:
+                        raise ValueError(f"Invalid CSR received: {e}")
 
-                    if not csr_data:
-                        continue
-
-                    # Process the CSR and generate a signed certificate
-                    csr = x509.load_pem_x509_csr(csr_data)
-                    print("Received CSR from Agent.")
+                    # Generate and send the signed certificate
                     signed_cert = gateway.sign_csr(csr)
-
-                    # Send the signed certificate to the Agent
-                    client_socket.sendall(signed_cert)
+                    signed_cert_bytes = signed_cert.public_bytes(serialization.Encoding.PEM)
+                    client_socket.sendall(len(signed_cert_bytes).to_bytes(4, 'big') + signed_cert_bytes)
                 except Exception as e:
                     print(f"Error processing request: {e}")
 
