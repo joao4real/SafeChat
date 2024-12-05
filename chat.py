@@ -1,185 +1,145 @@
 import os
 import socket
 import base64
-from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
 from cryptography.hazmat.backends import default_backend
 from cryptography import x509
-from cryptography.hazmat.primitives.serialization import Encoding, load_pem_private_key
 from cryptography.hazmat.primitives.asymmetric import padding
-
-
-def load_and_validate_cert(cert_data):
-    """Validate and load the certificate."""
-    try:
-        certificate = x509.load_pem_x509_certificate(cert_data, backend=default_backend())
-        print("Certificate is valid.")
-        return certificate
-    except Exception as e:
-        raise ValueError(f"Failed to load or validate certificate: {e}")
-
-
-def decrypt_session_key(encrypted_session_key, private_key):
-    """Decrypt the session key with the agent's private key."""
-    print("Decrypting session key...")
-    try:
-        session_key = private_key.decrypt(
-            encrypted_session_key,
-            padding.OAEP(
-                mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                algorithm=hashes.SHA256(),
-                label=None
-            )
-        )
-        if len(session_key) != 32:
-            raise ValueError(f"Invalid session key size: {len(session_key)} bytes")
-        print(f"Decrypted session key: {session_key.hex()}")
-        return session_key
-    except Exception as e:
-        print(f"Error during decryption: {e}")
-        raise
-
-
-def encrypt_session_key(session_key, recipient_public_key):
-    """Encrypt the session key with the recipient's public key."""
-    print(f"Encrypting session key: {session_key.hex()}")
-    return recipient_public_key.encrypt(
-        session_key,
-        padding.OAEP(
-            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-            algorithm=hashes.SHA256(),
-            label=None
-        )
-    )
-
 
 def decrypt_message(encrypted_message, session_key):
     """Decrypt a message using the session key (AES)."""
-    encrypted_message = base64.b64decode(encrypted_message)
-    iv, encrypted_message = encrypted_message[:16], encrypted_message[16:]
-    cipher = Cipher(algorithms.AES(session_key), modes.CFB(iv), backend=default_backend())
-    decryptor = cipher.decryptor()
-    decrypted_message = decryptor.update(encrypted_message) + decryptor.finalize()
-
     try:
+        encrypted_message = base64.b64decode(encrypted_message)
+        iv, encrypted_message = encrypted_message[:16], encrypted_message[16:]
+        cipher = Cipher(algorithms.AES(session_key), modes.CFB(iv), backend=default_backend())
+        decryptor = cipher.decryptor()
+        decrypted_message = decryptor.update(encrypted_message) + decryptor.finalize()
         return decrypted_message.decode('utf-8')
-    except UnicodeDecodeError as e:
-        print(f"Error decoding message: {e}")
-        return decrypted_message
-
+    except Exception as e:
+        print(f"Error during decryption: {e}")
+        return None
 
 def encrypt_message(message, session_key):
     """Encrypt a message using the session key (AES)."""
-    iv = os.urandom(16)
-    cipher = Cipher(algorithms.AES(session_key), modes.CFB(iv), backend=default_backend())
-    encryptor = cipher.encryptor()
+    try:
+        iv = os.urandom(16)
+        cipher = Cipher(algorithms.AES(session_key), modes.CFB(iv), backend=default_backend())
+        encryptor = cipher.encryptor()
+        encrypted_message = encryptor.update(message.encode('utf-8')) + encryptor.finalize()
+        return base64.b64encode(iv + encrypted_message)
+    except Exception as e:
+        print(f"Error during encryption: {e}")
+        return None
+
+def start_chat(agent, host='localhost', port=5001):
+    """
+    Implements secure chat between two agents, using certificates
+    and keys dynamically loaded via the agent's configuration.
+    """
+    print(f"Starting chat at {host}:{port}...")
 
     try:
-        encrypted_message = encryptor.update(message.encode('utf-8')) + encryptor.finalize()
-    except UnicodeEncodeError as e:
-        print(f"Error encoding message: {e}")
-        encrypted_message = encryptor.update(message) + encryptor.finalize()
-
-    return base64.b64encode(iv + encrypted_message)
+        # Load agent's certificate and private key
+        with open(agent.signed_cert_file_path, "rb") as cert_file:
+            agent_cert = x509.load_pem_x509_certificate(cert_file.read(), backend=default_backend())
+        agent_private_key = agent.load_private_key()
 
 
-def load_private_key(file_path, passphrase=None):
-    """Load the private key from the PEM file."""
-    with open(file_path, "rb") as key_file:
-        return load_pem_private_key(
-            key_file.read(),
-            password=passphrase.encode() if passphrase else None,
-            backend=default_backend()
-        )
+        print("Agent certificate and private key loaded successfully.")
+    except Exception as e:
+        print(f"Error loading certificate or private key: {e}")
+        return
 
-
-def start_chat(agent, port=5001):
-    """Starts the chat after certificate and session key exchange."""
-    print(f"Waiting for another agent to join on port {port}...")
-    
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            if port == 5001:
-                # Agent 1 waits for Agent 2 to connect
-                s.bind(('localhost', port))
-                s.listen(1)
-                print("Waiting for connection...")
-                conn, addr = s.accept()
-                print(f"Connected to {addr}")
-            else:
-                # Agent 2 connects to Agent 1
-                s.connect(('localhost', 5001))
-                conn = s
-                print("Connected to Agent 1.")
+        if port == 5001:
+            # Server (Agent 1)
+            s.bind((host, port))
+            s.listen(1)
+            print("Waiting for a connection...")
+            conn, addr = s.accept()
+            print(f"Connection established with {addr}")
+        else:
+            # Client (Agent 2)
+            s.connect((host, 5001))
+            conn = s
+            print("Connected to Agent 1.")
 
-            with conn:
-                # Step 1: Exchange Certificates
-                print("Exchanging certificates...")
-                with open(agent.signed_cert_file_path, "rb") as file:
-                    my_cert_data = file.read()
-                
-                # Send this agent's certificate
-                conn.sendall(my_cert_data)
-                
-                # Receive the other agent's certificate
-                peer_cert_data = conn.recv(4096)  # Adjust buffer size if necessary
-                
-                # Validate the received certificate
-                peer_cert = load_and_validate_cert(peer_cert_data)
+        with conn:
+            # Exchange certificates
+            print("Exchanging certificates...")
+            conn.send(agent_cert.public_bytes(encoding=serialization.Encoding.PEM))
+            peer_cert_data = conn.recv(4096)
+
+            try:
+                peer_cert = x509.load_pem_x509_certificate(peer_cert_data, backend=default_backend())
+                agent.validate_certificate(peer_cert)
                 peer_public_key = peer_cert.public_key()
-                print("Certificate exchange successful.")
+                print("Peer certificate validated successfully.")
+            except Exception as e:
+                print(f"Certificate validation error: {e}")
+                return
 
-                # Step 2: Session Key Exchange
+            if port == 5001:
+                # Server: Generate and send session key
+                session_key = os.urandom(32)
+                encrypted_session_key = peer_public_key.encrypt(
+                    session_key,
+                    padding.OAEP(
+                        mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                        algorithm=hashes.SHA256(),
+                        label=None
+                    )
+                )
+                conn.send(encrypted_session_key)
+                print("Session key sent.")
+            else:
+                # Client: Receive and decrypt session key
+                encrypted_session_key = conn.recv(4096)
+                session_key = agent_private_key.decrypt(
+                    encrypted_session_key,
+                    padding.OAEP(
+                        mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                        algorithm=hashes.SHA256(),
+                        label=None
+                    )
+                )
+                print("Session key decrypted successfully.")
+
+            # Start secure chat
+            print("Secure chat established. Type 'exit' to quit.")
+            while True:
                 if port == 5001:
-                    # Agent 1 generates and encrypts the session key
-                    session_key = os.urandom(32)
-                    encrypted_session_key = encrypt_session_key(session_key, peer_public_key)
-                    print(f"Agent 1 sent encrypted session key: {base64.b64encode(encrypted_session_key).decode('utf-8')}")
-                    conn.sendall(encrypted_session_key)
+                    # Server sends a message
+                    message = input("You (Server): ")
+                    if message.lower() == 'exit':
+                        conn.send(encrypt_message("exit", session_key))
+                        print("Chat ended.")
+                        break
+                    encrypted_message = encrypt_message(message, session_key)
+                    conn.send(encrypted_message)
+
+                    # Server receives a message
+                    encrypted_response = conn.recv(4096)
+                    response = decrypt_message(encrypted_response, session_key)
+                    if response.lower() == 'exit':
+                        print("Client ended the chat.")
+                        break
+                    print(f"Client: {response}")
                 else:
-                    # Agent 2 receives and decrypts the session key
-                    encrypted_session_key = conn.recv(2048)
-                    with open(agent.private_key_file_path, "rb") as key_file:
-                        private_key = load_pem_private_key(
-                            key_file.read(),
-                            password=agent.pem_passphrase,
-                            backend=default_backend()
-                        )
-                    try:
-                        session_key = decrypt_session_key(encrypted_session_key, private_key)
-                        print(f"Agent 2 decrypted session key: {session_key.hex()}")
-                    except Exception as e:
-                        print(f"Error in decrypting session key: {e}")
-                        return
-                
-                print("Session established. Start chatting! (type 'exit' to quit)")
+                    # Client receives a message
+                    encrypted_message = conn.recv(4096)
+                    message = decrypt_message(encrypted_message, session_key)
+                    if message.lower() == 'exit':
+                        print("Server ended the chat.")
+                        break
+                    print(f"Server: {message}")
 
-                # Step 3: Chat Loop
-                while True:
-                    if port == 5001:
-                        message = input("You: ")
-                        if message.lower() == 'exit':
-                            print("Ending chat session.")
-                            break
-                        conn.sendall(encrypt_message(message, session_key))
-                        print(f"Agent 1 sent: {message}")
-
-                        encrypted_response = conn.recv(2048)
-                        if not encrypted_response:
-                            print("Other agent disconnected.")
-                            break
-                        print(f"Other Agent: {decrypt_message(encrypted_response, session_key)}")
-                    else:
-                        encrypted_message = conn.recv(2048)
-                        if not encrypted_message:
-                            print("Other agent disconnected.")
-                            break
-                        print(f"Other Agent: {decrypt_message(encrypted_message, session_key)}")
-                        
-                        message = input("You: ")
-                        if message.lower() == 'exit':
-                            print("Ending chat session.")
-                            break
-                        conn.sendall(encrypt_message(message, session_key))
-        except Exception as e:
-            print(f"Error occurred during chat: {e}")
+                    # Client sends a message
+                    response = input("You (Client): ")
+                    if response.lower() == 'exit':
+                        conn.send(encrypt_message("exit", session_key))
+                        print("Chat ended.")
+                        break
+                    encrypted_response = encrypt_message(response, session_key)
+                    conn.send(encrypted_response)
