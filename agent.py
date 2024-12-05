@@ -8,28 +8,43 @@ from cryptography import x509
 from cryptography.hazmat.primitives import hashes
 from chat import start_chat  # Import start_chat from chat.py
 
-
 class Agent:
     def __init__(self, agent_id, pem_passphrase=None):
         self.agent_id = agent_id
         self.pem_passphrase = pem_passphrase
         self.agent_folder_path = os.path.join(os.getcwd(), f"Agent{self.agent_id}")
-        os.makedirs(self.agent_folder_path, exist_ok=True)
         self.private_key_file_path = os.path.join(self.agent_folder_path, f"agent{self.agent_id}_private_key.pem")
         self.csr_file_path = os.path.join(self.agent_folder_path, f"agent{self.agent_id}_csr.pem")
         self.signed_cert_file_path = os.path.join(self.agent_folder_path, f"agent{self.agent_id}_signed_cert.pem")
-        self.private_key = None
+        self.gateway_cert = None  # Initialize the attribute
+        os.makedirs(self.agent_folder_path, exist_ok=True)
 
     def check_existing_files(self):
+        """Check if necessary files already exist."""
         if os.path.isfile(self.private_key_file_path) and os.path.isfile(self.csr_file_path):
-            print(f"Files for agent {self.agent_id} already exist.")
+            print(f"Files for Agent {self.agent_id} already exist.")
             overwrite = input("Do you want to overwrite the existing files? (y/n): ").lower()
-            if overwrite != 'y':
-                print("Using the existing files.")
-                return True
+            return overwrite != 'y'
         return False
 
+    def prompt_passphrase(self, confirm=False):
+        """Prompt the user for a PEM passphrase."""
+        while True:
+            passphrase = getpass.getpass("Enter the PEM passphrase: ")
+            if len(passphrase) >= 8:
+                if confirm:
+                    confirm_passphrase = getpass.getpass("Confirm the PEM passphrase: ")
+                    if passphrase == confirm_passphrase:
+                        return passphrase.encode('utf-8')
+                    else:
+                        print("Passphrases do not match. Try again.")
+                else:
+                    return passphrase.encode('utf-8')
+            else:
+                print("Passphrase must be at least 8 characters long. Try again.")
+
     def create_private_key(self):
+        """Create and save a private key."""
         private_key = rsa.generate_private_key(
             public_exponent=65537,
             key_size=4096,
@@ -42,31 +57,11 @@ class Agent:
         with open(self.private_key_file_path, "wb") as file:
             file.write(private_key_pem)
         return private_key
-    
-    def get_passphrase(self):
-        while True:
-            pem_passphrase = getpass.getpass("Enter the PEM passphrase: ")
-            if len(pem_passphrase) >= 8:
-                confirm_passphrase = getpass.getpass("Confirm the PEM passphrase: ")
-                if pem_passphrase == confirm_passphrase:
-                    return pem_passphrase.encode('utf-8')  # Convert passphrase to bytes
-                else:
-                    print("Passphrases do not match. Please try again.")
-            else:
-                print("Passphrase must be at least 8 characters long. Please try again.")
 
     def load_private_key(self):
-        """Load the private key from file."""
+        """Load the private key from a file."""
         if not self.pem_passphrase:
-            # Prompt for PEM passphrase if not already provided
-            while True:
-                pem_passphrase = getpass.getpass("Enter the PEM passphrase to load the private key: ")
-                if len(pem_passphrase) >= 8:
-                    self.pem_passphrase = pem_passphrase.encode('utf-8')
-                    break
-                else:
-                    print("Passphrase must be at least 8 characters long. Please try again.")
-        
+            self.pem_passphrase = self.prompt_passphrase()
         with open(self.private_key_file_path, "rb") as file:
             private_key = serialization.load_pem_private_key(
                 file.read(),
@@ -75,134 +70,148 @@ class Agent:
             )
         return private_key
 
-    def get_public_key(self, private_key):
-        """Extract public key from the private key."""
-        return private_key.public_key()
-
     def create_csr(self, private_key):
-        ### CHANGE THE ATTRIBUTES TO PROMPT WISE
+        """Create a certificate signing request (CSR)."""
         csr = x509.CertificateSigningRequestBuilder().subject_name(x509.Name([
             x509.NameAttribute(x509.NameOID.COUNTRY_NAME, "PT"),
             x509.NameAttribute(x509.NameOID.STATE_OR_PROVINCE_NAME, "Lisboa"),
             x509.NameAttribute(x509.NameOID.LOCALITY_NAME, "Porto"),
             x509.NameAttribute(x509.NameOID.ORGANIZATION_NAME, "AgentCA"),
             x509.NameAttribute(x509.NameOID.COMMON_NAME, f"Agent{self.agent_id}"),
-        ]))
-        csr = csr.sign(private_key, hashes.SHA256())
+        ])).sign(private_key, hashes.SHA256())
         with open(self.csr_file_path, "wb") as file:
             file.write(csr.public_bytes(serialization.Encoding.PEM))
         return csr
     
-    def send_csr_to_gateway(self, csr_pem):
+    def fetch_gateway_certificate(self):
+        """Fetch the Gateway's certificate and store it in the gateway_cert variable."""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect(('localhost', 5000))  # Connect to the Gateway server (localhost:5000)
+                s.connect(('localhost', 5000))  # Connect to the Gateway
+                # Request the Gateway certificate by establishing a handshake
+                cert_length = int.from_bytes(s.recv(4), 'big')
+                gateway_cert_data = s.recv(cert_length)
 
-                # Receive the Gateway's certificate
-                gateway_cert_data = b""
-                while True:
-                    chunk = s.recv(1024)
-                    gateway_cert_data += chunk
-                    if len(chunk) < 1024:  # Assuming this is the end of the certificate data
-                        break
+                # Parse and store the Gateway certificate
+                self.gateway_cert = x509.load_pem_x509_certificate(gateway_cert_data, backend=default_backend())
+                print("Gateway's certificate successfully fetched and stored.")
+        except Exception as e:
+            print(f"Error fetching Gateway certificate: {e}")
+            self.gateway_cert = None
 
-                # Save or store the Gateway's certificate
-                if gateway_cert_data:
-                    gateway_cert = x509.load_pem_x509_certificate(gateway_cert_data)
-                    print("Gateway's certificate received successfully.")
-                else:
-                    raise ValueError("Failed to receive Gateway's certificate.")
+    def send_csr_to_gateway(self, csr_pem):
+        """Send the CSR to the Gateway and retrieve the signed certificate."""
+        try:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+                s.connect(('localhost', 5000))
 
-                # Send the CSR to the Gateway
-                s.sendall(csr_pem)
+                # Receive Gateway's certificate
+                cert_length = int.from_bytes(s.recv(4), 'big')
+                gateway_cert_data = s.recv(cert_length)
+                try:
+                    self.gateway_cert = x509.load_pem_x509_certificate(gateway_cert_data)
+                    print("Gateway's certificate successfully parsed and stored.")
+                except Exception as e:
+                    print(f"Failed to parse Gateway's certificate: {e}")
+                    self.gateway_cert = None  # Explicitly set to None if parsing fails
+                    return None
 
-                # Receive the signed certificate from the Gateway
-                signed_cert_data = b""
-                while True:
-                    chunk = s.recv(1024)
-                    signed_cert_data += chunk
-                    if len(chunk) < 1024:  # Assuming this is the end of the certificate data
-                        break
+                # Send CSR to Gateway
+                s.sendall(len(csr_pem).to_bytes(4, 'big') + csr_pem)
+
+                # Receive signed certificate
+                cert_length = int.from_bytes(s.recv(4), 'big')
+                signed_cert_data = s.recv(cert_length)
 
                 if signed_cert_data:
                     return signed_cert_data
                 else:
-                    raise ValueError("Failed to receive signed certificate from Gateway.")
+                    raise ValueError("Signed certificate not received.")
         except Exception as e:
             print(f"Error communicating with Gateway: {e}")
             return None
+    
+    def validate_certificate(self, peer_cert):
+        """Validate the peer's certificate using the Gateway's certificate."""
+        try:
+            if self.gateway_cert is None:
+                raise ValueError("Gateway certificate is not available for validation.")
+
+            # Check if the issuer of peer_cert matches the subject of gateway_cert
+            if peer_cert.issuer != self.gateway_cert.subject:
+                raise ValueError("Peer certificate was not issued by the trusted Gateway.")
+
+            # Check the validity period of peer_cert
+            if peer_cert.not_valid_before > datetime.now() or peer_cert.not_valid_after < datetime.now():
+                raise ValueError("Peer certificate is not valid at the current time.")
+
+            print("Certificate validated successfully.")
+            return True
+        except Exception as e:
+            print(f"Certificate validation error: {e}")
+            return False
 
     def save_signed_certificate(self, signed_cert):
-        if signed_cert:
-            with open(self.signed_cert_file_path, "wb") as file:
-                file.write(signed_cert)
-            print(f"Signed certificate saved to {self.signed_cert_file_path}")
-        else:
-            print("Failed to receive signed certificate.")
+        """Save the signed certificate to a file."""
+        with open(self.signed_cert_file_path, "wb") as file:
+            file.write(signed_cert)
+        print(f"Signed certificate saved to {self.signed_cert_file_path}")
 
-    def generate_session_key(self):
-        """Generate a random session key (AES key)."""
-        return os.urandom(32)  # AES-256 key
-    
-    
     def load_peer_public_key_from_cert(self, cert_path):
-        """Load the peer's public key from their certificate."""
+        """Load peer's public key from their certificate."""
         with open(cert_path, "rb") as file:
             cert_data = file.read()
         cert = x509.load_pem_x509_certificate(cert_data)
         return cert.public_key()
-
+    
+    
 
 def main():
-    is_off = False  # Variable to control menu display
     while True:
         try:
             agent_id = int(input("Enter the agent ID (between 1 and 4): "))
             if 1 <= agent_id <= 4:
                 break
             else:
-                print("Invalid input! Please enter an agent ID between 1 and 4.")
+                print("Invalid ID! Please enter a number between 1 and 4.")
         except ValueError:
-            print("Invalid input! Please enter a valid integer for the agent ID.")
+            print("Invalid input! Please enter a valid number.")
 
     agent = Agent(agent_id)
 
     if not agent.check_existing_files():
-        pem_passphrase = agent.get_passphrase()
+        pem_passphrase = agent.prompt_passphrase(confirm=True)
         agent.pem_passphrase = pem_passphrase
-
         private_key = agent.create_private_key()
         csr = agent.create_csr(private_key)
-        print("Generated CSR")
-        print("Sending CSR to Gateway for signing...")
+        print("CSR generated and sent to Gateway.")
         signed_cert = agent.send_csr_to_gateway(csr.public_bytes(serialization.Encoding.PEM))
-        agent.save_signed_certificate(signed_cert)
+        if signed_cert:
+            agent.save_signed_certificate(signed_cert)
+        else:
+            print("Failed to obtain signed certificate from Gateway.")
+            return
 
-    # Load the private key for decryption
-    agent.private_key = agent.load_private_key()
+    private_key = agent.load_private_key()
 
-    while not is_off:
+    while True:
         print("\nAgent Menu:")
         print("[1] - Start Chatting")
         print("[2] - Exit")
-
         try:
             choice = int(input("Select an option (1-2): "))
-
             if choice == 1:
-                print("\nStarting secure chat...")
-                is_off = True  # Disable the menu while chatting
-                start_chat(agent, port=5000 + agent.agent_id)
-                is_off = False  # Re-Enable the menu while chatting
-                break;
+                print("Starting secure chat...")
+                # Ensure chat does not return to the menu until it's over
+                start_chat(agent, port=5000 + agent_id)  # This should block until the chat ends
+                print("Chat session ended. Returning to menu...")  # Once chat ends, return to menu
             elif choice == 2:
-                print("Exiting the menu.")
-                break
+                print("Exiting the program.")
+                break  # Exit program entirely
             else:
-                print("Invalid choice! Please select a valid option (1-2).")
+                print("Invalid choice! Please select 1 or 2.")
         except ValueError:
-            print("Invalid input! Please enter a number between 1 and 2.")
-
+            print("Invalid input! Please enter a valid number.")
 
 if __name__ == "__main__":
     main()
