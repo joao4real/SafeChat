@@ -45,25 +45,27 @@ def start_chat(agent, host='localhost', port=5001):
             agent_cert = x509.load_pem_x509_certificate(cert_file.read(), backend=default_backend())
         agent_private_key = agent.load_private_key()
 
-
         print("Agent certificate and private key loaded successfully.")
     except Exception as e:
         print(f"Error loading certificate or private key: {e}")
         return
 
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        if port == 5001:
-            # Server (Agent 1)
+        try:
+            # Try to connect as a client
+            s.connect((host, port))
+            conn = s
+            print("Connected to the server.")
+            is_server = False
+        except ConnectionRefusedError:
+            print("Connection refused. Starting as server...")
+            # If connection fails, start as server
             s.bind((host, port))
             s.listen(1)
             print("Waiting for a connection...")
             conn, addr = s.accept()
             print(f"Connection established with {addr}")
-        else:
-            # Client (Agent 2)
-            s.connect((host, 5001))
-            conn = s
-            print("Connected to Agent 1.")
+            is_server = True
 
         with conn:
             # Exchange certificates
@@ -80,7 +82,7 @@ def start_chat(agent, host='localhost', port=5001):
                 print(f"Certificate validation error: {e}")
                 return
 
-            if port == 5001:
+            if is_server:
                 # Server: Generate and send session key
                 session_key = os.urandom(32)
                 encrypted_session_key = peer_public_key.encrypt(
@@ -109,7 +111,7 @@ def start_chat(agent, host='localhost', port=5001):
             # Start secure chat
             print("Secure chat established. Type 'exit' to quit.")
             while True:
-                if port == 5001:
+                if is_server:
                     # Server sends a message
                     message = input("You (Server): ")
                     if message.lower() == 'exit':

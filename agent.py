@@ -203,7 +203,7 @@ def main():
             if choice == 1:
                 print("Starting secure chat...")
                 # Ensure chat does not return to the menu until it's over
-                start_chat(agent, port=5000 + agent_id)  # This should block until the chat ends
+                start_chat(agent)  # This should block until the chat ends
                 print("Chat session ended. Returning to menu...")  # Once chat ends, return to menu
             elif choice == 2:
                 print("Exiting the program.")
