@@ -12,6 +12,7 @@ from cryptography.hazmat.primitives.asymmetric import padding
 active_connections = []
 public_keys = {}
 session_key = None
+owner_port = None
 lock = threading.Lock()
 
 def decrypt_message(encrypted_message, session_key):
@@ -50,185 +51,239 @@ def encrypt_message(message, session_key):
         print(f"Error during encryption: {e}")
         return None
 
-def handle_send(conn, session_key, agent_name, end_chat_flag):
+def handle_send(known_peers, session_key, agent_name, end_chat_flag):
     """Handle sending messages in a separate thread."""
     while True:
         message = input()
+        if not message:
+            continue
+            
         if message.lower() == 'exit':
             encrypted_message = encrypt_message(f"{agent_name}: exit", session_key)
             if encrypted_message:
-                conn.send(encrypted_message.encode('utf-8'))
+                encoded = encrypted_message.encode('utf-8')
+                with lock:
+                    for conn, _ in known_peers.values():
+                        try:
+                            conn.sendall(encoded)
+                        except Exception:
+                            continue
             print(f"{agent_name}: left the chat.")
             end_chat_flag.set()
             break
-        encrypted_message = encrypt_message(f"{agent_name}: {message}", session_key)
+        
+        # Format and encrypt message
+        full_message = f"{agent_name}: {message}"
+        encrypted_message = encrypt_message(full_message, session_key)
         if encrypted_message:
+            encoded = encrypted_message.encode('utf-8')
             with lock:
-                for connection in active_connections:
-                    connection.send(encrypted_message.encode('utf-8'))
+                for conn, _ in known_peers.values():
+                    try:
+                        conn.sendall(encoded)
+                    except Exception:
+                        continue
 
-def handle_receive(conn, session_key, end_chat_flag):
+def handle_receive(conn, session_key, end_chat_flag, known_peers):
     """Handle receiving messages in a separate thread."""
-    while True:
-        if end_chat_flag.is_set():
-            break
-        conn.settimeout(1.0)
+    while not end_chat_flag.is_set():
         try:
+            conn.settimeout(1.0)
             received_data = conn.recv(4096)
             if not received_data:
                 continue
 
             try:
-                # Verify it's valid base64 first
-                base64.b64decode(received_data)
+                # Decode the received data
+                encoded_message = received_data.decode('utf-8')
                 
                 # Attempt decryption
-                message = decrypt_message(received_data, session_key)
-                if not message:
+                decrypted = decrypt_message(encoded_message, session_key)
+                if not decrypted:
                     continue
-                    
-                if message.lower().endswith('exit'):
-                    print(f"{message.split(': ')[0]} left the chat.")
-                    end_chat_flag.set()
-                    break
-                    
-                sender, msg = message.split(': ', 1)
-                print(f"{sender}: {msg}")
-                
-                # Forward original encoded message
+
+                if decrypted.lower().endswith('exit'):
+                    sender = decrypted.split(':')[0]
+                    print(f"{sender} left the chat.")
+                    continue
+
+                print(decrypted)  # Print the decrypted message
+
+                # Forward message only if it's not from us
                 with lock:
-                    for connection in active_connections:
-                        if connection != conn:
-                            connection.send(received_data)
-                            
-            except (ValueError, binascii.Error):
-                # Not a valid base64 message
+                    for peer_port, (peer_conn, _) in known_peers.items():
+                        if peer_conn != conn:
+                            try:
+                                # Send original encrypted data
+                                peer_conn.sendall(received_data)
+                            except Exception:
+                                continue
+
+            except (UnicodeDecodeError, binascii.Error):
                 continue
-            except Exception as e:
-                print(f"Error processing message: {e}")
-                continue
-                
+
         except socket.timeout:
             continue
+        except socket.error:
+            if not end_chat_flag.is_set():
+                break
 
-def start_chat(agent, host='localhost', port=5001):
-    """
-    Implements secure chat between multiple agents, using certificates
-    and keys dynamically loaded via the agent's configuration.
-    """
-    print(f"Starting chat at {host}:{port}...")
-
+def start_chat(agent, base_port=5001):
+    """Implements decentralized secure chat between multiple agents."""
+    agent_port = base_port + agent.agent_id
+    known_peers = {}  # {port: (conn, cert)}
+    
     try:
-        # Load agent's certificate and private key
-        with open(agent.signed_cert_file_path, "rb") as cert_file:
-            agent_cert = x509.load_pem_x509_certificate(cert_file.read(), backend=default_backend())
+        # Load certificates
+        agent_cert = x509.load_pem_x509_certificate(
+            open(agent.signed_cert_file_path, "rb").read())
         agent_private_key = agent.load_private_key()
+        print("Certificates loaded successfully")
 
-        print("Agent and gateway certificates loaded successfully.")
+        # Start listener socket
+        listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM) 
+        listener.bind(('localhost', agent_port))
+        listener.listen(5)
+        print(f"Listening on port {agent_port}")
+
+        # Try to join existing chat first
+        session_key = None
+        for port in range(base_port, base_port + 5):
+            if port != agent_port:
+                try:
+                    peer_sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                    peer_sock.connect(('localhost', port))
+                    print(f"Connected to existing chat on port {port}")
+                    session_key = join_chat(peer_sock, agent, agent_cert, 
+                                          agent_private_key, known_peers)
+                    if session_key:
+                        break
+                except ConnectionRefusedError:
+                    continue
+
+        # If no existing chat found, create new one
+        if not session_key:
+            session_key = os.urandom(32)
+            print(f"Created new chat session as first participant")
+
+        # Start message threads
+        end_flag = threading.Event()
+        chat_threads = []
+
+        # Start send thread
+        send_thread = threading.Thread(
+            target=handle_send,
+            args=(known_peers, session_key, f"Agent{agent.agent_id}", end_flag)
+        )
+        send_thread.start()
+        chat_threads.append(send_thread)
+
+        # Accept new peers
+        while not end_flag.is_set():
+            try:
+                listener.settimeout(1.0)
+                conn, addr = listener.accept()
+                print(f"New peer connected from {addr}")
+                threading.Thread(
+                    target=handle_peer_connection,
+                    args=(conn, agent, agent_cert, agent_private_key, 
+                          known_peers, session_key)
+                ).start()
+            except socket.timeout:
+                continue
+            except socket.error as e:
+                print(f"Socket error: {e}")
+                break
+
+        # Cleanup
+        end_flag.set()
+        for thread in chat_threads:
+            thread.join()
+        for peer in known_peers.values():
+            peer[0].close()
+        listener.close()
+
     except Exception as e:
-        print(f"Error loading certificate or private key: {e}")
+        print(f"Chat error: {e}")
         return
 
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        try:
-            # Try to connect as a client
-            s.connect((host, port))
-            conn = s
-            print("Connected to the server.")
-            is_server = False
-        except ConnectionRefusedError:
-            print("Connection refused. Starting as server...")
-            # If connection fails, start as server
-            s.bind((host, port))
-            s.listen(5)
-            print("Waiting for connections...")
-            is_server = True
-
-        if is_server:
-            while True:
-                conn, addr = s.accept()
-                print(f"Connection established with {addr}")
-                with lock:
-                    active_connections.append(conn)
-                threading.Thread(target=handle_client, args=(conn, agent, agent_cert, agent_private_key, is_server)).start()
-        else:
-            with lock:
-                active_connections.append(conn)
-            handle_client(conn, agent, agent_cert, agent_private_key, is_server)
-
-def handle_client(conn, agent, agent_cert, agent_private_key, is_server):
-    global session_key
+def join_chat(conn, agent, agent_cert, agent_private_key, known_peers):
+    """Join existing chat session"""
     try:
         # Exchange certificates
-        print("Exchanging certificates...")
         conn.send(agent_cert.public_bytes(encoding=serialization.Encoding.PEM))
         peer_cert_data = conn.recv(4096)
+        peer_cert = x509.load_pem_x509_certificate(peer_cert_data)
 
-        try:
-            peer_cert = x509.load_pem_x509_certificate(peer_cert_data, backend=default_backend())
-            agent.validate_certificate(peer_cert, agent.gateway_cert)
-            peer_public_key = peer_cert.public_key()
-            print("Peer certificate validated successfully.")
-        except Exception as e:
-            print(f"Certificate validation error: {e}")
+        if not agent.validate_certificate(peer_cert, agent.gateway_cert):
+            print("Peer certificate validation failed")
+            conn.close()
+            return None
+
+        # Get session key from peer
+        peer_public_key = peer_cert.public_key()
+        encrypted_key = base64.b64decode(conn.recv(4096))
+        session_key = agent_private_key.decrypt(
+            encrypted_key,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
+            )
+        )
+        print(f"Received and decrypted session key from peer")
+
+        # Store peer connection
+        peer_port = conn.getpeername()[1]
+        known_peers[peer_port] = (conn, peer_cert)
+        
+        # Start receive thread for this connection
+        end_flag = threading.Event()
+        threading.Thread(target=handle_receive,
+                       args=(conn, session_key, end_flag, known_peers)).start()
+        
+        return session_key
+
+    except Exception as e:
+        print(f"Error joining chat: {e}")
+        conn.close()
+        return None
+
+def handle_peer_connection(conn, agent, agent_cert, agent_private_key, known_peers, session_key):
+    """Handle new peer joining chat"""
+    try:
+        # Exchange certificates
+        conn.send(agent_cert.public_bytes(encoding=serialization.Encoding.PEM))
+        peer_cert_data = conn.recv(4096)
+        peer_cert = x509.load_pem_x509_certificate(peer_cert_data)
+
+        if not agent.validate_certificate(peer_cert, agent.gateway_cert):
+            print("Peer certificate validation failed")
+            conn.close()
             return
 
-        with lock:
-            public_keys[conn] = peer_public_key
-
-        if is_server:
-            # Server: Generate and send session key
-            with lock:
-                if session_key is None:
-                    session_key = os.urandom(32)
-                for connection, public_key in public_keys.items():
-                    encrypted_session_key = public_key.encrypt(
-                        session_key,
-                        padding.OAEP(
-                            mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                            algorithm=hashes.SHA256(),
-                            label=None
-                        )
-                    )
-                    connection.send(base64.b64encode(encrypted_session_key))
-                print("Session key sent to all agents.")
-
-        else:
-            # Client: Receive and decrypt session key
-            encrypted_session_key = base64.b64decode(conn.recv(4096))
-            session_key = agent_private_key.decrypt(
-                encrypted_session_key,
-                padding.OAEP(
-                    mgf=padding.MGF1(algorithm=hashes.SHA256()),
-                    algorithm=hashes.SHA256(),
-                    label=None
-                )
+        # Send session key
+        peer_public_key = peer_cert.public_key()
+        encrypted_key = peer_public_key.encrypt(
+            session_key,
+            padding.OAEP(
+                mgf=padding.MGF1(algorithm=hashes.SHA256()),
+                algorithm=hashes.SHA256(),
+                label=None
             )
-            ##print("Session key decrypted successfully.")
+        )
+        conn.send(base64.b64encode(encrypted_key))
+        print(f"Sent encrypted session key to new peer")
 
-        # Start secure chat
-        print("\nSecure chat established. Type 'exit' to quit.")
-        agent_name = f"Agent{agent.agent_id}"
+        # Store peer connection
+        peer_port = conn.getpeername()[1]
+        known_peers[peer_port] = (conn, peer_cert)
 
-        # Send join message
-        join_message = f"System: {agent_name} joined the chat" #o nome do agente que aparece é o do master agent
-        encrypted_join = encrypt_message(join_message, session_key)
-        if encrypted_join:
-            with lock:
-                for connection in active_connections:
-                    if connection != conn:
-                        connection.send(encrypted_join.encode('utf-8'))
+        # Start receive thread for this peer
+        end_flag = threading.Event()
+        threading.Thread(target=handle_receive,
+                       args=(conn, session_key, end_flag, known_peers)).start()
 
-        end_chat_flag = threading.Event()
-        send_thread = threading.Thread(target=handle_send, args=(conn, session_key, agent_name, end_chat_flag))
-        receive_thread = threading.Thread(target=handle_receive, args=(conn, session_key, end_chat_flag))
-        send_thread.start()
-        receive_thread.start()
-        send_thread.join()
-        receive_thread.join()
-        print("Chat session ended. Returning to menu.")
-    finally:
-        with lock:
-            active_connections.remove(conn)
-            del public_keys[conn]
+    except Exception as e:
+        print(f"Error handling peer connection: {e}")
         conn.close()
