@@ -1,6 +1,7 @@
 import os
 import socket
 import getpass
+from datetime import datetime, timezone
 from cryptography.hazmat.primitives.asymmetric import rsa, padding
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.backends import default_backend
@@ -68,6 +69,7 @@ class Agent:
                 password=self.pem_passphrase,
                 backend=default_backend()
             )
+        self.fetchGatewayCertificate()
         return private_key
 
     def create_csr(self, private_key):
@@ -83,39 +85,35 @@ class Agent:
             file.write(csr.public_bytes(serialization.Encoding.PEM))
         return csr
     
-    def fetch_gateway_certificate(self):
-        """Fetch the Gateway's certificate and store it in the gateway_cert variable."""
-        try:
-            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect(('localhost', 5000))  # Connect to the Gateway
-                # Request the Gateway certificate by establishing a handshake
-                cert_length = int.from_bytes(s.recv(4), 'big')
-                gateway_cert_data = s.recv(cert_length)
 
-                # Parse and store the Gateway certificate
-                self.gateway_cert = x509.load_pem_x509_certificate(gateway_cert_data, backend=default_backend())
-                print("Gateway's certificate successfully fetched and stored.")
-        except Exception as e:
-            print(f"Error fetching Gateway certificate: {e}")
-            self.gateway_cert = None
+    def fetchGatewayCertificate(self):
+        """Fetch the Gateway's certificate and store it in the gateway_cert variable."""
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.connect(('localhost', 5000))
+            # Request the Gateway certificate by establishing a handshake
+            cert_length = int.from_bytes(s.recv(4), 'big')
+            gateway_cert_data = s.recv(cert_length)
+
+            # Parse and store the Gateway certificate
+            self.gateway_cert = x509.load_pem_x509_certificate(gateway_cert_data, backend=default_backend())
+
+            print("Gateway's certificate successfully fetched and stored.")
+
+
 
     def send_csr_to_gateway(self, csr_pem):
         """Send the CSR to the Gateway and retrieve the signed certificate."""
         try:
             with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-                s.connect(('localhost', 5000))
+                
 
-                # Receive Gateway's certificate
-                cert_length = int.from_bytes(s.recv(4), 'big')
-                gateway_cert_data = s.recv(cert_length)
                 try:
-                    self.gateway_cert = x509.load_pem_x509_certificate(gateway_cert_data)
-                    print("Gateway's certificate successfully parsed and stored.")
+                    self.fetchGatewayCertificate()
                 except Exception as e:
-                    print(f"Failed to parse Gateway's certificate: {e}")
-                    self.gateway_cert = None  # Explicitly set to None if parsing fails
+                    print(f"Error fetching Gateway certificate: {e}")
                     return None
-
+                
+                s.connect(('localhost', 5000))
                 # Send CSR to Gateway
                 s.sendall(len(csr_pem).to_bytes(4, 'big') + csr_pem)
 
@@ -131,18 +129,18 @@ class Agent:
             print(f"Error communicating with Gateway: {e}")
             return None
     
-    def validate_certificate(self, peer_cert):
+    def validate_certificate(self, peer_cert, gateway_cert):
         """Validate the peer's certificate using the Gateway's certificate."""
         try:
-            if self.gateway_cert is None:
+            if gateway_cert is None:
                 raise ValueError("Gateway certificate is not available for validation.")
 
             # Check if the issuer of peer_cert matches the subject of gateway_cert
-            if peer_cert.issuer != self.gateway_cert.subject:
+            if peer_cert.issuer != gateway_cert.subject:
                 raise ValueError("Peer certificate was not issued by the trusted Gateway.")
 
             # Check the validity period of peer_cert
-            if peer_cert.not_valid_before > datetime.now() or peer_cert.not_valid_after < datetime.now():
+            if peer_cert.not_valid_before_utc > datetime.now(timezone.utc) or peer_cert.not_valid_after_utc < datetime.now(timezone.utc):
                 raise ValueError("Peer certificate is not valid at the current time.")
 
             print("Certificate validated successfully.")
@@ -204,7 +202,7 @@ def main():
                 print("Starting secure chat...")
                 # Ensure chat does not return to the menu until it's over
                 start_chat(agent)  # This should block until the chat ends
-                print("Chat session ended. Returning to menu...")  # Once chat ends, return to menu
+                print("You exited from the chat. \nReturning to menu...")  # Once chat ends, return to menu
             elif choice == 2:
                 print("Exiting the program.")
                 break  # Exit program entirely
