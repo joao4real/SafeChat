@@ -8,9 +8,12 @@ This project provides a Python-based implementation of a secure communication sy
 
 ```
 .
-|-- Gateway.py
-|-- Agent.py
+|-- .gitignore
+|-- agent.py
+|-- chat.py
+|-- gateway.py
 |-- README.md
+|-- requirements.txt
 ```
 
 ### File Descriptions
@@ -89,6 +92,7 @@ The server will start on `localhost:5000` and handle Agent requests.
 - `save_signed_certificate(signed_cert)`: Saves the signed certificate received from the Gateway.
 - `get_passphrase()`: Prompts the user to set or confirm a PEM passphrase.
 
+
 #### Usage
 
 Run the Agent script:
@@ -116,16 +120,53 @@ Follow the prompts to:
 
 ---
 
+### Chat.py
+
+#### Key Methods
+
+- `load_and_validate_cert(cert_data)`: Validates and loads a certificate from PEM data.
+- `decrypt_session_key(encrypted_session_key, private_key)`: Decrypts the session key using the agent's private key.
+- `encrypt_session_key(session_key, recipient_public_key)`: Encrypts the session key using the recipient's public key.
+decrypt_message(encrypted_message, session_key): Decrypts a message using the session key (AES).
+- `encrypt_message(message, session_key)`: Encrypts a message using the session key (AES).
+- `load_private_key(file_path, passphrase)`: Loads the private key from a PEM file.
+- `start_chat(agent, port)`: Starts the chat after certificate and session key exchange.
+
+
+#### Usage
+To start a secure chat session between two agents, ensure both agents have their signed certificates and private keys ready. Then, run the start_chat function from the Agent class:
+
+```python
+from chat import start_chat
+start_chat(agent, port=5001)
+```
+
+---
+
+## Communication Workflow
+
+1. Certificate Exchange
+- Each agent sends its signed certificate to the other agent.
+Each agent validates the received certificate.
+
+2. Session Key Exchange
+- One agent generates a session key and encrypts it with the other agent's public key.
+- The other agent decrypts the session key using its private key.
+
+3. Secure Chat:
+- Agents use the session key to encrypt and decrypt messages during the chat session.
+
+---
+
+
+
 ## Requirements
 
 - Python 3.8 or later
-- `cryptography` library
-- Zoneinfo (standard in Python 3.9+)
-
-To install required packages:
+- Run the command to install the required dependencies:
 
 ```bash
-pip install cryptography
+pip install requirements.txt
 ```
 
 ---
@@ -165,7 +206,7 @@ This project is licensed under the MIT License. Feel free to use and modify the 
 
 ---
 
-## Author
+## Authors
 
 Developed by Jorge Gomes, João Macedo, Vasco Baleia, Pedro Duarte, Daniel Ciríaco and Vicente Silva.
 This project was developed in the course of Security Engineering and Architecture of the Computer Engineering MSc [MEI]
